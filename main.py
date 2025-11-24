@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
 import random  # <-- Підключили бібліотеку для випадкового вибору
 
 app = FastAPI()
@@ -99,5 +98,3 @@ def get_random_meal(type: str):
     else:
         return {"error": "Unknown meal type"}
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
