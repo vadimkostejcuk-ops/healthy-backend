@@ -1,10 +1,16 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 import uvicorn
 import os
 import json
+
+# --- БІБЛІОТЕКИ ДЛЯ БАЗИ ДАНИХ ---
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from datetime import datetime
 
 app = FastAPI()
 
@@ -16,12 +22,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- НАЛАШТУВАННЯ OPENAI ---
-# Ми беремо ключ зі "змінних середовища" (щоб не світити його в коді)
-client = OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY"),
-)
+# --- 1. НАЛАШТУВАННЯ БАЗИ ДАНИХ ---
+# Якщо є посилання від Render (в інтернеті) - беремо його.
+# Якщо немає (локально) - створюємо файл 'local.db' на комп'ютері.
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    # Render іноді дає старий формат посилання, треба виправити на новий
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite:///./local.db"  # Локальна база
+
+# Створюємо двигун бази даних
+if "sqlite" in DATABASE_URL:
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    engine = create_engine(DATABASE_URL)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# --- 2. МОДЕЛЬ ТАБЛИЦІ (Як виглядає рядок у базі) ---
+class UserDB(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True)
+    email = Column(String, unique=True, index=True)  # Пошта має бути унікальною
+    password = Column(String)  # У реальному проекті паролі треба хешувати!
+    calories = Column(Integer)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# Створюємо таблицю, якщо її немає
+Base.metadata.create_all(bind=engine)
+
+# Функція для отримання доступу до бази (Dependency)
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# --- НАЛАШТУВАННЯ ШІ ---
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+
+# --- МОДЕЛІ ДЛЯ ЗАПИТІВ ---
 class UserParams(BaseModel):
     gender: str
     weight: float
@@ -30,13 +79,22 @@ class UserParams(BaseModel):
     activity: float
     goal: str
 
+class UserRegistration(BaseModel):
+    name: str
+    email: str
+    password: str
+    calories: int
+
+
+# --- ЕНДПОІНТИ (РУЧКИ) ---
+
 @app.get("/")
 def read_root():
-    return {"message": "AI Server is running!"}
+    return {"message": "Database & AI Server is running!"}
 
+# РОЗРАХУНОК (Без змін)
 @app.post("/calculate")
 def calculate_calories(user: UserParams):
-    # (Тут стара логіка розрахунку залишається без змін)
     if user.gender == 'male':
         bmr = (10 * user.weight) + (6.25 * user.height) - (5 * user.age) + 5
     else:
@@ -70,54 +128,60 @@ def calculate_calories(user: UserParams):
         "macros": {"protein": p_g, "fat": f_g, "carbs": c_g}
     }
 
-# --- НОВА ШІ-РУЧКА ---
+# ШІ ГЕНЕРАЦІЯ (Без змін)
 @app.get("/get_meal")
 def get_ai_meal(type: str):
-    
-    # Промпт (Інструкція для ШІ)
     prompt = f"""
-    Придумай одну смачну та просту страву для категорії '{type}' (сніданок, обід або вечеря).
-    Відповідь МАЄ бути виключно у форматі JSON без зайвого тексту.
-    Структура JSON:
+    Придумай одну смачну та просту страву для категорії '{type}'.
+    JSON формат:
     {{
-        "name": "Назва страви (українською)",
-        "desc": "Короткий склад інгредієнтів (українською)",
-        "cals": приблизні калорії (число),
-        "p": білки (число),
-        "f": жири (число),
-        "c": вуглеводи (число),
-        "icon": "один емодзі, що підходить страві",
-        "color": "світлий пастельний колір (HEX) для фону іконки (наприклад #FFF3E0)"
+        "name": "Назва (укр)",
+        "desc": "Склад (укр)",
+        "cals": число,
+        "p": число, "f": число, "c": число,
+        "icon": "емодзі",
+        "color": "HEX світлий фон"
     }}
     """
-
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini", # Використовуємо дешеву і швидку модель
+            model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Ти професійний дієтолог. Ти відповідаєш тільки чистим JSON."},
+                {"role": "system", "content": "Ти дієтолог. Відповідай JSON."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.9 # Трішки креативності
+            temperature=0.9
         )
-        
-        # Отримуємо текст відповіді
         content = response.choices[0].message.content
-        
-        # Чистимо відповідь (іноді ШІ додає ```json ... ```)
         content = content.replace("```json", "").replace("```", "").strip()
-        
-        # Перетворюємо текст у справжній об'єкт Python
         meal_data = json.loads(content)
-        
         return meal_data
-
     except Exception as e:
-        print(f"Помилка OpenAI: {e}")
-        # Якщо ШІ не спрацював (або закінчилися гроші), повертаємо "аварійну" страву
+        print(f"Error: {e}")
         return {
-            "name": "Тимчасова страва",
-            "desc": "ШІ відпочиває, спробуйте пізніше",
-            "cals": 0, "p": 0, "f": 0, "c": 0,
-            "icon": "🤖", "color": "#EEEEEE"
+            "name": "Тимчасова страва", "desc": "ШІ відпочиває",
+            "cals": 0, "p": 0, "f": 0, "c": 0, "icon": "🤖", "color": "#EEEEEE"
         }
+
+# --- НОВА РУЧКА: РЕЄСТРАЦІЯ КОРИСТУВАЧА ---
+@app.post("/register")
+def register_user(user: UserRegistration, db: Session = Depends(get_db)):
+    # 1. Перевіряємо, чи є такий email
+    existing_user = db.query(UserDB).filter(UserDB.email == user.email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    # 2. Створюємо нового користувача
+    new_user = UserDB(
+        name=user.name,
+        email=user.email,
+        password=user.password, # Увага: тут треба хешувати в майбутньому!
+        calories=user.calories
+    )
+    
+    # 3. Записуємо в базу
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    return {"message": "User created successfully", "user_id": new_user.id}
